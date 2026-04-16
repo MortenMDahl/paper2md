@@ -45,6 +45,14 @@ Original images are replaced with interpreted blockquotes:
 
 Images that fail interpretation are marked with a `[WARNING: ...]` tag in the output so downstream consumers know which images weren't processed.
 
+## Example
+
+The `example-raw/` folder contains a sample PDF for testing. The included paper is:
+
+> Lowry, O. H., Rosebrough, N. J., Farr, A. L., & Randall, R. J. (1951). Protein measurement with the Folin phenol reagent. *Journal of Biological Chemistry*, 193(1), 265-275. https://doi.org/10.1016/S0021-9258(19)52451-6
+
+This article is Open Access under a [Creative Commons Attribution (CC BY)](https://creativecommons.org/licenses/by/4.0/) license. It is included here for demonstration purposes with attribution to the original authors.
+
 ## Requirements
 
 - Python 3.10+
