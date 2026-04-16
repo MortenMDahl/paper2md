@@ -1,0 +1,3 @@
+docling
+google-genai
+python-dotenv
