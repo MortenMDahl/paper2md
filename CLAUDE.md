@@ -14,6 +14,7 @@ export GEMINI_API_KEY="your-key"
 python process.py input.pdf                # outputs input.md
 python process.py input.pdf -o output.md   # custom output path
 python process.py input.pdf --model gemini-2.5-flash  # override model
+python process.py input.pdf --local        # offline, no API key needed
 ```
 
 ## Architecture
@@ -30,7 +31,9 @@ Key design constraint: the script is a clean CLI tool (file in → file out) so 
 
 - `docling` — IBM's PDF-to-Markdown converter (layout analysis, table extraction, figure extraction)
 - `google-genai` — Google GenAI SDK for Gemini Flash vision model calls
+- `llama-cpp-python` — (optional) local GGUF model inference for `--local` mode
+- `huggingface-hub` — (optional) model downloading for `--local` mode
 
 ## Environment Variables
 
-- `GEMINI_API_KEY` — required, Google AI Studio API key
+- `GEMINI_API_KEY` — required for Gemini mode (not needed with `--local`)

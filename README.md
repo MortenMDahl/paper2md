@@ -27,6 +27,7 @@ GEMINI_API_KEY=your-api-key-here
 python process.py paper.pdf                           # outputs paper.md
 python process.py paper.pdf -o output.md              # custom output path
 python process.py paper.pdf --model gemini-2.5-flash  # override model
+python process.py paper.pdf --local                   # offline local model
 ```
 
 ## Output format
@@ -53,9 +54,28 @@ The `example-raw/` folder contains a sample PDF for testing. The included paper 
 
 This article is Open Access under a [Creative Commons Attribution (CC BY)](https://creativecommons.org/licenses/by/4.0/) license. It is included here for demonstration purposes with attribution to the original authors.
 
+## Local mode
+
+The `--local` flag runs image interpretation entirely offline using a Gemma 4 E4B model via `llama-cpp-python`. No API key or external server needed.
+
+```bash
+pip install llama-cpp-python huggingface-hub
+python process.py paper.pdf --local
+```
+
+On first run, model files (~5.9 GB total) are downloaded from Hugging Face and cached. Subsequent runs start immediately.
+
+**Note:** The local model (Gemma 4 E4B, 7.5B params) produces noticeably lower quality image descriptions compared to Gemini Flash — expect less precise quantitative detail and occasional misidentifications. It's best suited as an offline fallback when API access isn't available. As local vision models improve, this gap should narrow.
+
+**Hardware requirements:**
+- **CPU:** ~8 GB free RAM (slower, but works on any machine)
+- **GPU:** ~6 GB VRAM for full GPU offload (NVIDIA with CUDA, or Apple Silicon via Metal)
+
 ## Requirements
 
 - Python 3.10+
 - [Docling](https://github.com/docling-project/docling) — PDF-to-Markdown conversion
 - [google-genai](https://github.com/googleapis/python-genai) — Gemini API SDK
 - [python-dotenv](https://github.com/theskumar/python-dotenv) — `.env` file loading
+- [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) — (optional) local model inference for `--local` mode
+- [huggingface-hub](https://github.com/huggingface/huggingface_hub) — (optional) model downloading for `--local` mode

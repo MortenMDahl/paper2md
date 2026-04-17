@@ -1,3 +1,7 @@
 docling
 google-genai
 python-dotenv
+
+# Optional: for --local mode
+# llama-cpp-python
+# huggingface-hub
