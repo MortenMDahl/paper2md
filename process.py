@@ -24,8 +24,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from docling.datamodel.base_models import InputFormat
+from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import ImageRefMode, PictureItem
 
@@ -71,20 +72,71 @@ p-values, confidence intervals)
 # PDF parsing
 # ---------------------------------------------------------------------------
 
-def convert_pdf(pdf_path: Path):
-    """Parse a PDF with Docling, extracting figure images."""
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.generate_picture_images = True
-    pipeline_options.images_scale = 2.0
+def _make_pipeline_options(generate_images: bool = True, images_scale: float = 2.0):
+    """Build memory-optimized PdfPipelineOptions."""
+    opts = PdfPipelineOptions()
+    opts.generate_picture_images = generate_images
+    opts.images_scale = images_scale
+    opts.generate_parsed_pages = False   # Free page data after processing
+    opts.generate_page_images = False
+    opts.generate_table_images = False
+    opts.document_timeout = 600
+    return opts
 
+
+def convert_pdf(pdf_path: Path):
+    """Parse a PDF with Docling, extracting figure images.
+
+    Strategy:
+    1. Try default docling-parse backend with memory-optimized settings.
+    2. If errors occur (std::bad_alloc), retry with pypdfium2 backend
+       which bypasses the buggy C++ parser entirely.
+    """
+    # --- Attempt 1: default backend, optimized settings ---
+    opts = _make_pipeline_options(generate_images=True, images_scale=2.0)
     converter = DocumentConverter(
         format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+            InputFormat.PDF: PdfFormatOption(pipeline_options=opts),
         }
     )
+    result = converter.convert(str(pdf_path), raises_on_error=False)
 
-    result = converter.convert(str(pdf_path))
-    return result.document
+    if result.status == ConversionStatus.SUCCESS:
+        return result.document
+
+    n_errors = len(result.errors) if result.errors else 0
+    print(
+        f"  Default backend had {n_errors} error(s), retrying with pypdfium2 backend...",
+        file=sys.stderr,
+    )
+
+    # --- Attempt 2: pypdfium2 backend (bypasses C++ docling-parse) ---
+    opts = _make_pipeline_options(generate_images=True, images_scale=1.5)
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=opts,
+                backend=PyPdfiumDocumentBackend,
+            ),
+        }
+    )
+    result = converter.convert(str(pdf_path), raises_on_error=False)
+
+    if result.status == ConversionStatus.SUCCESS:
+        print(f"  pypdfium2 backend succeeded.", file=sys.stderr)
+        return result.document
+
+    n_errors = len(result.errors) if result.errors else 0
+    if result.status == ConversionStatus.PARTIAL_SUCCESS:
+        print(
+            f"  pypdfium2 partial conversion ({n_errors} error(s)) — using available content.",
+            file=sys.stderr,
+        )
+        return result.document
+
+    raise RuntimeError(
+        f"PDF conversion failed on both backends ({n_errors} error(s))"
+    )
 
 
 def extract_images(document):
