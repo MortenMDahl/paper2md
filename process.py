@@ -16,10 +16,12 @@ Requires:
 """
 
 import argparse
+import atexit
 import gc
 import io
 import os
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -211,6 +213,42 @@ def cleanup_all():
     _converter_default = None
     _converter_pypdfium = None
     cleanup_gpu()
+
+
+_crash_handlers_installed = False
+
+
+def _install_crash_handlers():
+    """Register atexit, signal, and excepthook handlers to ensure cleanup.
+
+    Safe to call multiple times — only installs once.
+    """
+    global _crash_handlers_installed
+    if _crash_handlers_installed:
+        return
+    _crash_handlers_installed = True
+
+    atexit.register(cleanup_all)
+
+    def _signal_cleanup(signum, frame):
+        print(
+            f"\n  [cleanup] Signal {signum} received — releasing GPU resources...",
+            file=sys.stderr,
+        )
+        cleanup_all()
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, _signal_cleanup)
+    if hasattr(signal, "SIGBREAK"):  # Windows only
+        signal.signal(signal.SIGBREAK, _signal_cleanup)
+
+    _original_excepthook = sys.excepthook
+
+    def _excepthook_cleanup(exc_type, exc_value, exc_tb):
+        cleanup_all()
+        _original_excepthook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _excepthook_cleanup
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +534,14 @@ def process(pdf_path: Path, model: str, api_key: str = None, local_llm=None) -> 
                 descriptions.append("[WARNING: Image could not be extracted from PDF]")
                 continue
 
+            # Periodic memory pressure check every 3 images
+            if i > 1 and (i - 1) % 3 == 0:
+                try:
+                    from vmcheck import check_memory_pressure
+                    check_memory_pressure()
+                except ImportError:
+                    pass
+
             print(f"  Interpreting image {i}/{len(images)}...", file=sys.stderr)
             if local_llm is not None:
                 desc, success = describe_image_local(local_llm, image, context)
@@ -548,6 +594,16 @@ def _format_description(figure_num: int, description: str) -> str:
 def main():
     load_dotenv()
 
+    # Pre-flight: check system health before loading heavy models
+    try:
+        from vmcheck import check_system_health
+        check_system_health()
+    except ImportError:
+        pass
+
+    # Ensure GPU resources are released on crash/signal/exit
+    _install_crash_handlers()
+
     parser = argparse.ArgumentParser(
         description=(
             "Convert a scientific PDF to LLM-readable Markdown "
@@ -598,6 +654,18 @@ def main():
         output_path.write_text(markdown, encoding="utf-8")
         print(f"Done → {output_path}", file=sys.stderr)
     finally:
+        # Free the llama-cpp-python model FIRST — it holds VRAM through
+        # GGML/CUDA, which torch.cuda.empty_cache() cannot release.
+        if local_llm is not None:
+            if hasattr(local_llm, "close"):
+                local_llm.close()
+            # Also free the CLIP vision encoder held by the chat handler.
+            handler = getattr(local_llm, "chat_handler", None)
+            if handler is not None and hasattr(handler, "close"):
+                handler.close()
+            del local_llm
+            local_llm = None
+            gc.collect()
         # Always release GPU resources on exit to prevent orphaned CUDA
         # contexts from destabilising the NVIDIA driver.
         cleanup_all()
