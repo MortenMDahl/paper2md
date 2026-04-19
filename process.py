@@ -143,6 +143,13 @@ def convert_pdf(pdf_path: Path):
         file=sys.stderr,
     )
 
+    # Destroy the failed converter to free C++ memory (std::bad_alloc
+    # means the docling-parse backend consumed all available RAM).
+    global _converter_default
+    _converter_default = None
+    del result
+    cleanup_gpu()
+
     # --- Attempt 2: pypdfium2 backend (bypasses C++ docling-parse) ---
     converter = _get_pypdfium_converter()
     result = converter.convert(str(pdf_path), raises_on_error=False)
