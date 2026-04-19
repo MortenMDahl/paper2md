@@ -16,6 +16,8 @@ Requires:
 """
 
 import argparse
+import gc
+import io
 import os
 import re
 import sys
@@ -29,8 +31,6 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import ImageRefMode, PictureItem
 
-import io
-
 try:
     from google import genai
     from google.genai import types
@@ -39,6 +39,12 @@ except ImportError:
     types = None
 
 GEMINI_MODEL = "gemini-2.5-flash"
+
+# ---------------------------------------------------------------------------
+# Converter cache — avoids reloading PyTorch models for every call
+# ---------------------------------------------------------------------------
+_converter_default: DocumentConverter | None = None
+_converter_pypdfium: DocumentConverter | None = None
 
 LOCAL_HF_REPO = "ggml-org/gemma-4-E4B-it-GGUF"
 LOCAL_MODEL_FILE = "gemma-4-E4B-it-Q4_K_M.gguf"
@@ -83,6 +89,36 @@ def _make_pipeline_options(generate_images: bool = True, images_scale: float = 2
     return opts
 
 
+def _get_default_converter() -> DocumentConverter:
+    """Return a cached default-backend DocumentConverter (created once)."""
+    global _converter_default
+    if _converter_default is None:
+        opts = _make_pipeline_options(generate_images=True, images_scale=2.0)
+        _converter_default = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=opts),
+            }
+        )
+    return _converter_default
+
+
+def _get_pypdfium_converter() -> DocumentConverter:
+    """Return a cached pypdfium2-backend DocumentConverter (created once)."""
+    global _converter_pypdfium
+    if _converter_pypdfium is None:
+        from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+        opts = _make_pipeline_options(generate_images=True, images_scale=1.5)
+        _converter_pypdfium = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_options=opts,
+                    backend=PyPdfiumDocumentBackend,
+                ),
+            }
+        )
+    return _converter_pypdfium
+
+
 def convert_pdf(pdf_path: Path):
     """Parse a PDF with Docling, extracting figure images.
 
@@ -90,14 +126,12 @@ def convert_pdf(pdf_path: Path):
     1. Try default docling-parse backend with memory-optimized settings.
     2. If errors occur (std::bad_alloc), retry with pypdfium2 backend
        which bypasses the buggy C++ parser entirely.
+
+    Converters are cached and reused across calls to avoid reloading
+    PyTorch models (and leaking GPU memory) on every paper.
     """
     # --- Attempt 1: default backend, optimized settings ---
-    opts = _make_pipeline_options(generate_images=True, images_scale=2.0)
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=opts),
-        }
-    )
+    converter = _get_default_converter()
     result = converter.convert(str(pdf_path), raises_on_error=False)
 
     if result.status == ConversionStatus.SUCCESS:
@@ -110,16 +144,7 @@ def convert_pdf(pdf_path: Path):
     )
 
     # --- Attempt 2: pypdfium2 backend (bypasses C++ docling-parse) ---
-    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
-    opts = _make_pipeline_options(generate_images=True, images_scale=1.5)
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(
-                pipeline_options=opts,
-                backend=PyPdfiumDocumentBackend,
-            ),
-        }
-    )
+    converter = _get_pypdfium_converter()
     result = converter.convert(str(pdf_path), raises_on_error=False)
 
     if result.status == ConversionStatus.SUCCESS:
@@ -146,6 +171,39 @@ def extract_images(document):
         if isinstance(item, PictureItem):
             images.append(item.image)  # PIL Image or None
     return images
+
+
+# ---------------------------------------------------------------------------
+# GPU / resource cleanup
+# ---------------------------------------------------------------------------
+
+def cleanup_gpu():
+    """Release GPU memory held by PyTorch/CUDA.
+
+    Call this after processing each paper to prevent VRAM accumulation,
+    and on shutdown to avoid orphaned CUDA contexts that destabilise the
+    NVIDIA driver (especially on Windows where the GPU also drives the
+    display).
+    """
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except ImportError:
+        pass
+
+
+def cleanup_all():
+    """Full teardown: discard cached converters and free GPU memory.
+
+    Use this on program exit to ensure nothing is left behind.
+    """
+    global _converter_default, _converter_pypdfium
+    _converter_default = None
+    _converter_pypdfium = None
+    cleanup_gpu()
 
 
 # ---------------------------------------------------------------------------
@@ -389,70 +447,82 @@ def describe_image(client, model: str, image, context: str) -> tuple[str, bool]:
 
 def process(pdf_path: Path, model: str, api_key: str = None, local_llm=None) -> str:
     """Full pipeline: PDF → Markdown with interpreted figures."""
-    # Step 1 — parse PDF
-    print("  Parsing PDF with Docling...", file=sys.stderr)
-    document = convert_pdf(pdf_path)
+    document = None
+    images = []
+    try:
+        # Step 1 — parse PDF
+        print("  Parsing PDF with Docling...", file=sys.stderr)
+        document = convert_pdf(pdf_path)
 
-    # Step 2 — collect images (PIL objects, in document order)
-    images = extract_images(document)
+        # Step 2 — collect images (PIL objects, in document order)
+        images = extract_images(document)
 
-    # Step 3 — export markdown with placeholders
-    markdown = document.export_to_markdown(image_mode=ImageRefMode.PLACEHOLDER)
+        # Step 3 — export markdown with placeholders
+        markdown = document.export_to_markdown(image_mode=ImageRefMode.PLACEHOLDER)
 
-    if not images:
-        print("  No images found in document.", file=sys.stderr)
+        if not images:
+            print("  No images found in document.", file=sys.stderr)
+            return markdown
+
+        # Step 4 — build context for each placeholder from the markdown text
+        contexts = build_contexts(markdown)
+
+        if len(contexts) != len(images):
+            print(
+                f"  Warning: found {len(images)} images but {len(contexts)} "
+                f"placeholders — some images may be mis-aligned.",
+                file=sys.stderr,
+            )
+
+        # Step 5 — describe each image with the vision model
+        client = None
+        if local_llm is None:
+            client = genai.Client(api_key=api_key)
+        descriptions: list[str] = []
+        warnings: list[str] = []
+
+        for i, (image, context) in enumerate(zip(images, contexts), start=1):
+            if image is None:
+                msg = f"Image {i}: could not be extracted from PDF"
+                print(f"  Warning: {msg}", file=sys.stderr)
+                warnings.append(msg)
+                descriptions.append("[WARNING: Image could not be extracted from PDF]")
+                continue
+
+            print(f"  Interpreting image {i}/{len(images)}...", file=sys.stderr)
+            if local_llm is not None:
+                desc, success = describe_image_local(local_llm, image, context)
+            else:
+                desc, success = describe_image(client, model, image, context)
+            if not success:
+                msg = f"Image {i}: interpretation failed"
+                print(f"  Warning: {msg}", file=sys.stderr)
+                warnings.append(msg)
+            descriptions.append(desc)
+
+        # Step 6 — replace placeholders with formatted descriptions
+        for i, desc in enumerate(descriptions, start=1):
+            block = _format_description(i, desc)
+            markdown = markdown.replace(PLACEHOLDER, block, 1)
+
+        if warnings:
+            print(
+                f"  Completed with {len(warnings)} warning(s):",
+                file=sys.stderr,
+            )
+            for w in warnings:
+                print(f"    - {w}", file=sys.stderr)
+
         return markdown
 
-    # Step 4 — build context for each placeholder from the markdown text
-    contexts = build_contexts(markdown)
-
-    if len(contexts) != len(images):
-        print(
-            f"  Warning: found {len(images)} images but {len(contexts)} "
-            f"placeholders — some images may be mis-aligned.",
-            file=sys.stderr,
-        )
-
-    # Step 5 — describe each image with the vision model
-    client = None
-    if local_llm is None:
-        client = genai.Client(api_key=api_key)
-    descriptions: list[str] = []
-    warnings: list[str] = []
-
-    for i, (image, context) in enumerate(zip(images, contexts), start=1):
-        if image is None:
-            msg = f"Image {i}: could not be extracted from PDF"
-            print(f"  Warning: {msg}", file=sys.stderr)
-            warnings.append(msg)
-            descriptions.append("[WARNING: Image could not be extracted from PDF]")
-            continue
-
-        print(f"  Interpreting image {i}/{len(images)}...", file=sys.stderr)
-        if local_llm is not None:
-            desc, success = describe_image_local(local_llm, image, context)
-        else:
-            desc, success = describe_image(client, model, image, context)
-        if not success:
-            msg = f"Image {i}: interpretation failed"
-            print(f"  Warning: {msg}", file=sys.stderr)
-            warnings.append(msg)
-        descriptions.append(desc)
-
-    # Step 6 — replace placeholders with formatted descriptions
-    for i, desc in enumerate(descriptions, start=1):
-        block = _format_description(i, desc)
-        markdown = markdown.replace(PLACEHOLDER, block, 1)
-
-    if warnings:
-        print(
-            f"  Completed with {len(warnings)} warning(s):",
-            file=sys.stderr,
-        )
-        for w in warnings:
-            print(f"    - {w}", file=sys.stderr)
-
-    return markdown
+    finally:
+        # Free document and image data to release GPU/RAM resources.
+        del document
+        for img in images:
+            if img is not None and hasattr(img, "close"):
+                img.close()
+        images.clear()
+        cleanup_gpu()
 
 
 def _format_description(figure_num: int, description: str) -> str:
@@ -514,11 +584,16 @@ def main():
 
     output_path = args.output or args.pdf.with_suffix(".md")
 
-    print(f"Processing: {args.pdf}", file=sys.stderr)
-    markdown = process(args.pdf, args.model, api_key=api_key, local_llm=local_llm)
+    try:
+        print(f"Processing: {args.pdf}", file=sys.stderr)
+        markdown = process(args.pdf, args.model, api_key=api_key, local_llm=local_llm)
 
-    output_path.write_text(markdown, encoding="utf-8")
-    print(f"Done → {output_path}", file=sys.stderr)
+        output_path.write_text(markdown, encoding="utf-8")
+        print(f"Done → {output_path}", file=sys.stderr)
+    finally:
+        # Always release GPU resources on exit to prevent orphaned CUDA
+        # contexts from destabilising the NVIDIA driver.
+        cleanup_all()
 
 
 if __name__ == "__main__":
