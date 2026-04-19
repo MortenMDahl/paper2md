@@ -26,7 +26,6 @@ from dotenv import load_dotenv
 
 from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
-from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import ImageRefMode, PictureItem
 
@@ -111,6 +110,7 @@ def convert_pdf(pdf_path: Path):
     )
 
     # --- Attempt 2: pypdfium2 backend (bypasses C++ docling-parse) ---
+    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
     opts = _make_pipeline_options(generate_images=True, images_scale=1.5)
     converter = DocumentConverter(
         format_options={
